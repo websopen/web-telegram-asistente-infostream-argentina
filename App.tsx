@@ -5,17 +5,17 @@ import XTab from './components/XTab';
 import FinanceTab from './components/FinanceTab';
 import { Tab } from './types';
 import {
-  authenticateFromTelegram,
-  hasValidSession,
-  enforceTelegramOnly,
-  watchSessionExpiration,
-  clearSession
+  initTelegramWebAppAuth,
+  hasValidAuth,
+  expandTelegramWebApp,
+  getStoredUser
 } from './telegramAuth';
 
 const App: React.FC = () => {
   const [activeTab, setActiveTab] = useState<Tab>(Tab.X);
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
+  const [authError, setAuthError] = useState<string | null>(null);
 
   useEffect(() => {
     const initAuth = async () => {
@@ -23,9 +23,6 @@ const App: React.FC = () => {
         // Detectar si estamos en localhost
         const isLocalhost = window.location.hostname === 'localhost' ||
           window.location.hostname === '127.0.0.1';
-
-        // Enforce Telegram-only access (pero permite localhost)
-        enforceTelegramOnly();
 
         // Si es localhost, skip auth de Telegram
         if (isLocalhost) {
@@ -35,50 +32,52 @@ const App: React.FC = () => {
           return;
         }
 
+        // Expandir Telegram WebApp
+        expandTelegramWebApp();
+
         // Check existing session
-        if (hasValidSession()) {
+        if (hasValidAuth()) {
+          const user = getStoredUser();
+          console.log('✅ Sesión existente:', user);
           setIsAuthenticated(true);
           setIsLoading(false);
           return;
         }
 
-        // Authenticate from Telegram
-        const authData = await authenticateFromTelegram();
+        // Authenticate with backend
+        const result = await initTelegramWebAppAuth({
+          apiBaseUrl: 'https://api.websopen.com/api/v1', // Cambiar por tu URL
+          cardId: '29', // ID del bot creado anteriormente
+          onAuthSuccess: async (token, user) => {
+            console.log('✅ Autenticado como:', user.first_name);
+            setIsAuthenticated(true);
+            setIsLoading(false);
+          },
+          onAuthError: (error) => {
+            console.error('❌ Error de autenticación:', error);
+            setAuthError(error);
+            setIsLoading(false);
+          }
+        });
 
-        if (authData) {
-          setIsAuthenticated(true);
-        } else {
-          // Auth failed - close WebApp
+        if (!result.success) {
+          setAuthError(result.error || 'Error de autenticación');
+          // Auth failed - close WebApp after showing error
           if (window.Telegram?.WebApp) {
-            window.Telegram.WebApp.close();
+            setTimeout(() => {
+              window.Telegram.WebApp.close();
+            }, 3000);
           }
         }
       } catch (error) {
         console.error('[App] Auth error:', error);
-        // Error shown by enforceTelegramOnly
-      } finally {
+        setAuthError('Error inesperado durante la autenticación');
         setIsLoading(false);
       }
     };
 
     initAuth();
   }, []);
-
-  // Watch for session expiration
-  useEffect(() => {
-    if (!isAuthenticated) return;
-
-    const cleanup = watchSessionExpiration(() => {
-      console.log('[App] Session expired');
-      clearSession();
-      if (window.Telegram?.WebApp) {
-        window.Telegram.WebApp.showAlert('Sesión expirada. Por favor, inicia sesión nuevamente.');
-        window.Telegram.WebApp.close();
-      }
-    });
-
-    return cleanup;
-  }, [isAuthenticated]);
 
   const renderContent = () => {
     switch (activeTab) {
@@ -105,7 +104,23 @@ const App: React.FC = () => {
   }
 
   if (!isAuthenticated) {
-    return null; // Or custom access denied screen if enforceTelegramOnly didn't catch it
+    if (authError) {
+      return (
+        <div className="min-h-screen bg-black flex items-center justify-center text-white p-6">
+          <div className="max-w-md text-center">
+            <div className="mb-6">
+              <svg className="w-16 h-16 mx-auto text-red-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+              </svg>
+            </div>
+            <h2 className="text-xl font-bold mb-3">Error de Acceso</h2>
+            <p className="text-gray-400 mb-4">{authError}</p>
+            <p className="text-sm text-gray-500">La aplicación se cerrará automáticamente...</p>
+          </div>
+        </div>
+      );
+    }
+    return null; // Or custom access denied screen
   }
 
   return (

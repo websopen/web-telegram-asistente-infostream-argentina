@@ -1,226 +1,287 @@
 /**
- * Telegram Authentication for Web Cards
- * Validates access from authorized Telegram users
+ * TelegramWebAppAuth - Autenticación para Web Cards de Telegram
+ * 
+ * Flujo de autenticación:
+ * 1. Usuario abre la webapp desde Telegram
+ * 2. La webapp valida initData con el backend
+ * 3. El backend verifica el access_token (código de asociación)
+ * 4. Si es válido, retorna un JWT
+ * 5. La webapp guarda el JWT y permite el acceso
  */
 
-export interface TelegramAuthData {
-    sessionToken: string;
-    expiresAt: string;
-    user: {
-        id: number;
-        username: string;
-        firstName: string;
-    };
-    cardId: string;
+export interface TelegramUser {
+    id: number;
+    first_name: string;
+    last_name?: string;
+    username?: string;
+    language_code?: string;
+    is_premium?: boolean;
+    photo_url?: string;
+}
+
+export interface AuthResponse {
+    success: boolean;
+    token?: string;
+    user?: TelegramUser;
+    error?: string;
+}
+
+export interface WebCardAuthConfig {
+    apiBaseUrl: string;
+    cardId: string; // ID del bot en la base de datos
+    onAuthSuccess?: (token: string, user: TelegramUser) => void | Promise<void>;
+    onAuthError?: (error: string) => void;
 }
 
 /**
- * Validates authentication from Telegram WebApp
- * @returns Session data if valid, null if invalid
+ * Obtener los datos de Telegram WebApp
  */
-export const authenticateFromTelegram = async (): Promise<TelegramAuthData | null> => {
-    // Verify we're in Telegram WebApp
-    if (!window.Telegram?.WebApp) {
-        console.error('[TelegramAuth] Not in Telegram WebApp');
+const getTelegramWebAppData = (): string | null => {
+    if (typeof window === 'undefined' || !window.Telegram?.WebApp) {
+        console.warn('[TelegramAuth] window.Telegram.WebApp no está disponible');
         return null;
     }
 
-    const WebApp = window.Telegram.WebApp;
-    const initData = WebApp.initData;
+    const initData = window.Telegram.WebApp.initData;
 
     if (!initData) {
-        console.error('[TelegramAuth] No initData available');
+        console.warn('[TelegramAuth] initData vacío');
         return null;
     }
 
-    // Get card_id and access_token from URL params
+    return initData;
+};
+
+/**
+ * Obtener el access_token de la URL
+ */
+const getAccessTokenFromUrl = (): string | null => {
     const urlParams = new URLSearchParams(window.location.search);
-    const cardId = urlParams.get('card_id');
-    const accessToken = urlParams.get('access_token');
+    return urlParams.get('access_token');
+};
 
-    if (!cardId || !accessToken) {
-        console.error('[TelegramAuth] Missing card_id or access_token in URL');
-        WebApp.showAlert('Token de acceso inválido. Por favor, solicita uno nuevo desde el bot.');
-        return null;
-    }
+/**
+ * Limpiar el access_token de la URL
+ */
+const cleanAccessTokenFromUrl = (): void => {
+    const url = new URL(window.location.href);
+    url.searchParams.delete('access_token');
+    window.history.replaceState({}, document.title, url.toString());
+};
 
+/**
+ * Autenticar usuario con el backend
+ */
+const authenticateWithBackend = async (
+    config: WebCardAuthConfig,
+    initData: string,
+    accessToken: string
+): Promise<AuthResponse> => {
     try {
-        // Call backend to validate
-        const apiUrl = import.meta.env.VITE_API_URL || '/api/v1';
-        const response = await fetch(`${apiUrl}/web-cards/auth/telegram`, {
+        const response = await fetch(`${config.apiBaseUrl}/web-cards/auth/telegram`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: {
+                'Content-Type': 'application/json',
+            },
             body: JSON.stringify({
-                initData,
-                cardId,
-                accessToken
-            })
+                card_id: config.cardId,
+                init_data: initData,
+                access_token: accessToken,
+            }),
         });
 
+        const data = await response.json();
+
         if (!response.ok) {
-            const error = await response.json();
-            console.error('[TelegramAuth] Validation failed:', error.error);
+            return {
+                success: false,
+                error: data.error || 'Error de autenticación',
+            };
+        }
 
-            // Show user-friendly error
-            if (error.error === 'Token expired - request a new one from the bot') {
-                WebApp.showAlert('Token expirado. Por favor, solicita uno nuevo desde el bot.');
-            } else if (error.error === 'User not authorized for this card') {
-                WebApp.showAlert('No tienes acceso a esta tarjeta. Contacta al administrador.');
-            } else if (error.error === 'Card not found or inactive') {
-                WebApp.showAlert('Tarjeta no disponible. Contacta al administrador.');
-            } else if (error.error === 'Maximum users reached for this card') {
-                WebApp.showAlert('Esta tarjeta alcanzó el máximo de usuarios permitidos.');
-            } else {
-                WebApp.showAlert('Error de autenticación: ' + error.error);
+        return {
+            success: true,
+            token: data.data.token,
+            user: data.data.user,
+        };
+    } catch (error) {
+        console.error('[TelegramAuth] Error en petición:', error);
+        return {
+            success: false,
+            error: 'Error de conexión con el servidor',
+        };
+    }
+};
+
+/**
+ * Guardar token en localStorage
+ */
+const saveAuthToken = (token: string): void => {
+    localStorage.setItem('web_card_token', token);
+    console.log('[TelegramAuth] ✅ Token guardado');
+};
+
+/**
+ * Obtener token guardado
+ */
+export const getStoredAuthToken = (): string | null => {
+    return localStorage.getItem('web_card_token');
+};
+
+/**
+ * Verificar si hay token válido
+ */
+export const hasValidAuth = (): boolean => {
+    const token = getStoredAuthToken();
+    return !!token;
+};
+
+/**
+ * Cerrar sesión
+ */
+export const logout = (): void => {
+    localStorage.removeItem('web_card_token');
+    localStorage.removeItem('telegram_user');
+    console.log('[TelegramAuth] 👋 Sesión cerrada');
+};
+
+/**
+ * Inicializar autenticación de Telegram WebApp
+ * 
+ * Ejemplo de uso:
+ * ```typescript
+ * useEffect(() => {
+ *   initTelegramWebAppAuth({
+ *     apiBaseUrl: 'https://api.tudominio.com/api/v1',
+ *     cardId: '29', // ID del bot en la base de datos
+ *     onAuthSuccess: async (token, user) => {
+ *       console.log('Usuario autenticado:', user);
+ *       setAuthToken(token);
+ *       setUser(user);
+ *     },
+ *     onAuthError: (error) => {
+ *       console.error('Error de autenticación:', error);
+ *       alert('No se pudo autenticar. Por favor, accede desde Telegram.');
+ *     }
+ *   });
+ * }, []);
+ * ```
+ */
+export const initTelegramWebAppAuth = async (
+    config: WebCardAuthConfig
+): Promise<AuthResponse> => {
+    console.log('[TelegramAuth] 🔐 Iniciando autenticación...');
+
+    // Verificar si ya hay token guardado
+    const storedToken = getStoredAuthToken();
+    if (storedToken) {
+        console.log('[TelegramAuth] ✅ Token existente encontrado');
+
+        // TODO: Aquí podrías verificar el token con el backend si quieres
+        // Por ahora asumimos que es válido
+
+        const storedUser = localStorage.getItem('telegram_user');
+        if (storedUser) {
+            const user = JSON.parse(storedUser);
+            if (config.onAuthSuccess) {
+                await config.onAuthSuccess(storedToken, user);
             }
+            return {
+                success: true,
+                token: storedToken,
+                user,
+            };
+        }
+    }
 
+    // Obtener initData de Telegram
+    const initData = getTelegramWebAppData();
+    if (!initData) {
+        const error = 'Esta aplicación solo funciona desde Telegram';
+        console.error('[TelegramAuth]', error);
+        if (config.onAuthError) {
+            config.onAuthError(error);
+        }
+        return {
+            success: false,
+            error,
+        };
+    }
+
+    // Obtener access_token de la URL
+    const accessToken = getAccessTokenFromUrl();
+    if (!accessToken) {
+        const error = 'Falta el código de acceso. Por favor, abre la app desde el bot de Telegram.';
+        console.error('[TelegramAuth]', error);
+        if (config.onAuthError) {
+            config.onAuthError(error);
+        }
+        return {
+            success: false,
+            error,
+        };
+    }
+
+    console.log('[TelegramAuth] 📡 Validando con el backend...');
+
+    // Autenticar con el backend
+    const authResult = await authenticateWithBackend(config, initData, accessToken);
+
+    if (authResult.success && authResult.token && authResult.user) {
+        // Guardar token y usuario
+        saveAuthToken(authResult.token);
+        localStorage.setItem('telegram_user', JSON.stringify(authResult.user));
+
+        // Limpiar URL
+        cleanAccessTokenFromUrl();
+
+        console.log('[TelegramAuth] ✅ Autenticación exitosa');
+        console.log('[TelegramAuth] Usuario:', authResult.user.first_name);
+
+        // Callback de éxito
+        if (config.onAuthSuccess) {
+            await config.onAuthSuccess(authResult.token, authResult.user);
+        }
+    } else {
+        console.error('[TelegramAuth] ❌ Error:', authResult.error);
+        if (config.onAuthError) {
+            config.onAuthError(authResult.error || 'Error desconocido');
+        }
+    }
+
+    return authResult;
+};
+
+/**
+ * Obtener usuario guardado
+ */
+export const getStoredUser = (): TelegramUser | null => {
+    const storedUser = localStorage.getItem('telegram_user');
+    if (storedUser) {
+        try {
+            return JSON.parse(storedUser);
+        } catch {
             return null;
         }
-
-        const data: TelegramAuthData = await response.json();
-
-        // Store session
-        localStorage.setItem('web_card_session', data.sessionToken);
-        localStorage.setItem('web_card_session_exp', data.expiresAt);
-        localStorage.setItem('web_card_user', JSON.stringify(data.user));
-        localStorage.setItem('web_card_id', data.cardId);
-
-        // Clean URL (remove tokens)
-        window.history.replaceState({}, '', window.location.pathname);
-
-        console.log('[TelegramAuth] ✅ Authenticated as', data.user.firstName);
-
-        return data;
-    } catch (error) {
-        console.error('[TelegramAuth] Network error:', error);
-        WebApp.showAlert('Error de red. Verifica tu conexión.');
-        return null;
     }
+    return null;
 };
 
 /**
- * Checks if there's a valid session
+ * Expandir Telegram WebApp a pantalla completa
  */
-export const hasValidSession = (): boolean => {
-    const token = localStorage.getItem('web_card_session');
-    const exp = localStorage.getItem('web_card_session_exp');
-
-    if (!token || !exp) return false;
-
-    // Check expiration
-    const expiresAt = new Date(exp);
-    const now = new Date();
-
-    if (expiresAt <= now) {
-        console.log('[TelegramAuth] Session expired');
-        clearSession();
-        return false;
+export const expandTelegramWebApp = (): void => {
+    if (window.Telegram?.WebApp) {
+        window.Telegram.WebApp.expand();
+        window.Telegram.WebApp.ready();
     }
-
-    return true;
-};
-
-/**
- * Gets current session token
- */
-export const getSessionToken = (): string | null => {
-    if (!hasValidSession()) return null;
-    return localStorage.getItem('web_card_session');
-};
-
-/**
- * Gets current user data
- */
-export const getCurrentUser = (): TelegramAuthData['user'] | null => {
-    if (!hasValidSession()) return null;
-
-    const userJson = localStorage.getItem('web_card_user');
-    if (!userJson) return null;
-
-    try {
-        return JSON.parse(userJson);
-    } catch {
-        return null;
-    }
-};
-
-/**
- * Gets current card ID
- */
-export const getCurrentCardId = (): string | null => {
-    if (!hasValidSession()) return null;
-    return localStorage.getItem('web_card_id');
-};
-
-/**
- * Clears session
- */
-export const clearSession = (): void => {
-    localStorage.removeItem('web_card_session');
-    localStorage.removeItem('web_card_session_exp');
-    localStorage.removeItem('web_card_user');
-    localStorage.removeItem('web_card_id');
-    console.log('[TelegramAuth] Session cleared');
-};
-
-/**
- * Enforces Telegram-only access (blocks direct browser access)
- * Except for localhost (development mode)
- */
-export const enforceTelegramOnly = (): void => {
-    // Permitir acceso desde localhost para desarrollo
-    const isLocalhost = window.location.hostname === 'localhost' ||
-        window.location.hostname === '127.0.0.1';
-
-    if (!window.Telegram?.WebApp && !isLocalhost) {
-        document.body.innerHTML = `
-            <div style="
-                display: flex;
-                flex-direction: column;
-                align-items: center;
-                justify-content: center;
-                height: 100vh;
-                text-align: center;
-                padding: 2rem;
-                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                color: white;
-            ">
-                <div style="font-size: 4rem; margin-bottom: 1rem;">🔒</div>
-                <h1 style="font-size: 1.5rem; margin-bottom: 1rem;">Acceso Solo por Telegram</h1>
-                <p style="margin-bottom: 0.5rem; opacity: 0.9;">Esta aplicación solo es accesible desde Telegram.</p>
-                <p style="opacity: 0.9;">Abre el <strong>Bot</strong> en Telegram para acceder.</p>
-            </div>
-        `;
-        throw new Error('Not in Telegram WebApp');
-    }
-
-    // Si es localhost, mostrar mensaje informativo en consola
-    if (isLocalhost && !window.Telegram?.WebApp) {
-        console.log('🔧 [DEV MODE] Accediendo desde localhost - Telegram Auth deshabilitado');
-    }
-};
-
-/**
- * Auto-logout on session expiration
- */
-export const watchSessionExpiration = (onExpire: () => void): () => void => {
-    const interval = setInterval(() => {
-        if (!hasValidSession()) {
-            onExpire();
-        }
-    }, 60000); // Check every minute
-
-    return () => clearInterval(interval);
 };
 
 export default {
-    authenticateFromTelegram,
-    hasValidSession,
-    getSessionToken,
-    getCurrentUser,
-    getCurrentCardId,
-    clearSession,
-    enforceTelegramOnly,
-    watchSessionExpiration
+    initTelegramWebAppAuth,
+    getStoredAuthToken,
+    getStoredUser,
+    hasValidAuth,
+    logout,
+    expandTelegramWebApp,
 };
